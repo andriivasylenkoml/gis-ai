@@ -624,11 +624,10 @@ def predict_cost_time(
     - C_hat_ij
     - T_hat_ij
 
-    Важно:
-    action = defer не должен прогнозироваться как обычная строительная работа.
-    Поэтому для defer задаём:
-    - малую административную стоимость;
-    - нулевое технологическое время.
+    Для defer задаётся:
+    - малая административная стоимость;
+    - нулевое технологическое время;
+    - нулевые ресурсы.
     """
 
     df = building_action_df.copy()
@@ -646,23 +645,15 @@ def predict_cost_time(
     df["C_hat_ij"] = df["C_hat_ij"].clip(lower=0)
     df["T_hat_ij"] = df["T_hat_ij"].clip(lower=0)
 
-    # --------------------------------------------------------
-    # Исправление для defer
-    # --------------------------------------------------------
-    # defer = отложить восстановление.
-    # Это не строительная операция, поэтому:
-    # - ресурсы уже равны 0;
-    # - технологическое время должно быть 0;
-    # - стоимость задаётся как малая административная стоимость.
-    # --------------------------------------------------------
-
     defer_mask = df["action"] == "defer"
 
     if defer_mask.any():
         access_factor = 1 + 0.2 * (1 - df.loc[defer_mask, "access_index"])
 
         df.loc[defer_mask, "C_hat_ij"] = (
-            df.loc[defer_mask, "area_m2"] * defer_cost_per_m2 * access_factor
+            df.loc[defer_mask, "area_m2"]
+            * defer_cost_per_m2
+            * access_factor
         ).clip(lower=0)
 
         df.loc[defer_mask, "T_hat_ij"] = 0.0
@@ -958,6 +949,7 @@ def optimize_actions(
     # Ограничения на количество отложенных зданий defer
 
     defer_penalty_term = 0
+    defer_vars = []
 
     if "defer" in actions:
         defer_vars = [
@@ -1088,7 +1080,11 @@ def optimize_actions(
     alpha_int = int(round(alpha_cost * 1000))
     beta_int = int(round(beta_time * 1000))
 
-    model.Minimize(alpha_int * total_cost + beta_int * T_total + defer_penalty_term)
+    model.Minimize(
+        alpha_int * total_cost
+        + beta_int * T_total
+        + alpha_int * defer_penalty_term
+    )
 
     # Решение
 
@@ -1156,11 +1152,15 @@ def optimize_actions(
         T_tech_real = float(active_selected["T_hat_ij"].max())
 
     T_total_real = max(T_tech_real, T_resource_real)
-
+    
+    defer_penalty_total_value = deferred_count_value * defer_penalty
+    
     result = {
         "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
         "selected": selected,
         "C_total": solver.Value(total_cost) / COST_SCALE,
+        "defer_penalty_total": defer_penalty_total_value,
+        "objective_value": solver.ObjectiveValue(),
 
         # Значения из OR-Tools
         "T_tech_solver": solver.Value(T_tech) / TIME_SCALE,
@@ -1308,16 +1308,18 @@ def run_full_pipeline():
         # остальные можно отложить, если бюджет мал.
         min_active_buildings=1,
 
-        # Например, не более 90% зданий можно отложить.
+        # Например, не более 70% зданий можно отложить.
         # Если хочешь разрешить откладывать сколько угодно, поставь None.
-        max_deferred_ratio=0.90,
-        defer_penalty=100_000,
+        max_deferred_ratio=0.70,
+        defer_penalty=200_000,
         max_time_seconds=60
     )
 
     print("\nOptimization result:")
     print("Status:", opt_result["status"])
     print("C_total:", opt_result["C_total"])
+    print("Defer penalty total:", opt_result["defer_penalty_total"])
+    print("Objective value:", opt_result["objective_value"])
 
     print("\nSolver time values:")
     print("T_tech_solver:", opt_result["T_tech_solver"])
