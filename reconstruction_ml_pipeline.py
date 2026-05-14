@@ -233,7 +233,7 @@ def is_action_allowed(row: pd.Series, action: str) -> int:
         return 0
 
     # Почти неповреждённое здание не нужно демонтировать
-    if damage <= 0.20 and action == "demolish":
+    if damage <= 0.50 and action == "demolish":
         return 0
 
     # Культурные объекты лучше не демонтировать
@@ -665,6 +665,76 @@ def predict_cost_time(
 
     return df
 
+def calculate_defer_priority(row: pd.Series) -> float:
+    """
+    Социальный приоритет здания.
+
+    Чем выше значение, тем хуже откладывать восстановление здания.
+
+    Используются:
+    - damage_level: степень повреждения;
+    - building_type: тип здания;
+    - zoning_category: категория зоны.
+    """
+
+    damage = float(row.get("damage_level", 0.0))
+    building_type = str(row.get("building_type", "unknown"))
+    zoning = str(row.get("zoning_category", "unknown"))
+
+    building_type_priority = {
+        "public": 1.0,
+        "residential": 0.9,
+        "cultural": 0.8,
+        "commercial": 0.5,
+        "industrial": 0.4,
+        "unknown": 0.3,
+    }.get(building_type, 0.3)
+
+    zoning_priority = {
+        "public": 1.0,
+        "residential": 0.9,
+        "mixed_use": 0.75,
+        "historical": 0.8,
+        "commercial": 0.5,
+        "industrial": 0.4,
+        "unknown": 0.3,
+    }.get(zoning, 0.3)
+
+    priority_score = (
+        0.6 * damage
+        + 0.3 * building_type_priority
+        + 0.1 * zoning_priority
+    )
+
+    return float(np.clip(priority_score, 0.0, 1.0))
+
+
+def add_social_defer_penalty(
+    df: pd.DataFrame,
+    base_defer_penalty: float = 100_000
+) -> pd.DataFrame:
+    """
+    Добавляет индивидуальный социальный штраф за defer.
+
+    defer_penalty_i = base_defer_penalty * defer_priority
+
+    Штраф применяется только к строкам, где action == "defer".
+    Для repair/rebuild/demolish штраф равен 0.
+    """
+
+    df = df.copy()
+
+    df["defer_priority"] = df.apply(calculate_defer_priority, axis=1)
+
+    df["defer_penalty_i"] = 0.0
+
+    defer_mask = df["action"] == "defer"
+
+    df.loc[defer_mask, "defer_penalty_i"] = (
+        base_defer_penalty * df.loc[defer_mask, "defer_priority"]
+    )
+
+    return df
 
 # 9. Сценарная модель S
 
@@ -917,6 +987,18 @@ def optimize_actions(
 
     df = pred_df.copy().reset_index(drop=True)
 
+    # Добавляем индивидуальный социальный штраф за defer.
+    # defer_penalty теперь трактуется как базовый штраф,
+    # который умножается на социальный приоритет здания.
+    if "defer_priority" not in df.columns or "defer_penalty_i" not in df.columns:
+        df = add_social_defer_penalty(
+            df,
+            base_defer_penalty=defer_penalty
+        )
+
+    buildings = sorted(df["building_id"].unique())
+    actions = sorted(df["action"].unique())
+
     buildings = sorted(df["building_id"].unique())
     actions = sorted(df["action"].unique())
 
@@ -948,7 +1030,7 @@ def optimize_actions(
 
     # Ограничения на количество отложенных зданий defer
 
-    defer_penalty_term = 0
+    defer_penalty_terms = []
     defer_vars = []
 
     if "defer" in actions:
@@ -957,6 +1039,13 @@ def optimize_actions(
             for i in buildings
             if (i, "defer") in x
         ]
+
+        for _, row in df[df["action"] == "defer"].iterrows():
+            i = row["building_id"]
+            j = row["action"]
+
+            penalty_int = int(round(float(row["defer_penalty_i"]) * COST_SCALE))
+            defer_penalty_terms.append(penalty_int * x[(i, j)])
 
     deferred_count = sum(defer_vars)
     active_count = len(buildings) - deferred_count
@@ -971,7 +1060,8 @@ def optimize_actions(
         max_deferred_from_ratio = int(np.floor(len(buildings) * max_deferred_ratio))
         model.Add(deferred_count <= max_deferred_from_ratio)
 
-    defer_penalty_term = int(round(defer_penalty * COST_SCALE)) * deferred_count
+    defer_penalty_term = sum(defer_penalty_terms)
+    
     
     # Стоимость
 
@@ -1153,7 +1243,9 @@ def optimize_actions(
 
     T_total_real = max(T_tech_real, T_resource_real)
     
-    defer_penalty_total_value = deferred_count_value * defer_penalty
+    defer_penalty_total_value = float(
+        selected.loc[selected["action"] == "defer", "defer_penalty_i"].sum()
+    )
     
     result = {
         "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
@@ -1174,6 +1266,10 @@ def optimize_actions(
 
         "deferred_count": deferred_count_value,
         "active_count": active_count_value,
+        "avg_defer_priority": float(
+            selected.loc[selected["action"] == "defer", "defer_priority"].mean()
+        ) if deferred_count_value > 0 else 0.0,
+        
         "resources": resources_real,
     }
 
@@ -1253,12 +1349,22 @@ def run_full_pipeline():
         cost_model=cost_model,
         time_model=time_model
     )
+    
+    pred_df = add_social_defer_penalty(
+        pred_df,
+        base_defer_penalty=200_000
+    )
 
     print("\nPredictions:")
     print(pred_df[[
         "building_id",
         "action",
         "q_ij",
+        "damage_level",
+        "building_type",
+        "zoning_category",
+        "defer_priority",
+        "defer_penalty_i",
         "C_hat_ij",
         "T_hat_ij",
         "labor_hours",
@@ -1308,9 +1414,9 @@ def run_full_pipeline():
         # остальные можно отложить, если бюджет мал.
         min_active_buildings=1,
 
-        # Например, не более 70% зданий можно отложить.
+        # Например, не более 90% зданий можно отложить.
         # Если хочешь разрешить откладывать сколько угодно, поставь None.
-        max_deferred_ratio=0.70,
+        max_deferred_ratio=0.90,
         defer_penalty=200_000,
         max_time_seconds=60
     )
@@ -1319,6 +1425,7 @@ def run_full_pipeline():
     print("Status:", opt_result["status"])
     print("C_total:", opt_result["C_total"])
     print("Defer penalty total:", opt_result["defer_penalty_total"])
+    print("Average defer priority:", opt_result["avg_defer_priority"])
     print("Objective value:", opt_result["objective_value"])
 
     print("\nSolver time values:")
@@ -1342,6 +1449,11 @@ def run_full_pipeline():
     print(opt_result["selected"][[
         "building_id",
         "action",
+        "damage_level",
+        "building_type",
+        "zoning_category",
+        "defer_priority",
+        "defer_penalty_i",
         "C_hat_ij",
         "T_hat_ij",
         "labor_hours",
