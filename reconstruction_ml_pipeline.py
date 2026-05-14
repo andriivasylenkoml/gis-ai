@@ -1,6 +1,7 @@
 import warnings
 warnings.filterwarnings("ignore")
 
+import buildings
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -48,72 +49,63 @@ TARGET_TIME = "duration_days"
 
 # 1. Чтение CSV с geometry в WKT
 
-def read_training_projects_csv(
-    csv_path: str,
-    source_crs: str = "EPSG:4326",
-    metric_crs: str = "EPSG:3857"
-) -> gpd.GeoDataFrame:
+def read_training_projects_table(csv_path: str) -> pd.DataFrame:
     """
-    Читает training_projects.csv.
+    Читает training_projects.csv в новом формате.
 
-    Ожидаемые минимальные поля:
-    - building_id
-    - geometry  # WKT Polygon
-    - floors
-    - damage_level
-    - building_type
-    - zoning_category
-
-    Если в CSV уже есть action, cost, duration_days,
-    они сохраняются.
-
-    На выходе добавляет:
-    - area_m2
-    - perimeter_m
+    Этот CSV уже готов для CatBoost и не содержит geometry.
+    Он должен содержать одинаковые признаки с прогнозной таблицей,
+    а также target-поля:
+    - cost
+    - duration_days
     """
 
     df = pd.read_csv(csv_path)
 
     required = [
         "building_id",
-        "geometry",
+        "area_m2",
+        "perimeter_m",
         "floors",
         "damage_level",
-        "building_type",
+        "access_index",
         "zoning_category",
+        "building_type",
+        "action",
+        "labor_hours",
+        "concrete_m3",
+        "steel_tons",
+        "equipment_hours",
+        "cost",
+        "duration_days",
     ]
 
     missing = [col for col in required if col not in df.columns]
+
     if missing:
-        raise ValueError(f"В training_projects.csv отсутствуют поля: {missing}")
+        raise ValueError(
+            f"В training_projects.csv отсутствуют поля: {missing}"
+        )
 
-    df["geometry"] = df["geometry"].apply(wkt.loads)
+    df["area_m2"] = df["area_m2"].astype(float)
+    df["perimeter_m"] = df["perimeter_m"].astype(float)
+    df["floors"] = df["floors"].fillna(1).astype(int)
+    df["damage_level"] = df["damage_level"].astype(float).clip(0, 1)
+    df["access_index"] = df["access_index"].astype(float).clip(0, 1)
 
-    gdf = gpd.GeoDataFrame(
-        df,
-        geometry="geometry",
-        crs=source_crs
-    )
+    df["zoning_category"] = df["zoning_category"].fillna("unknown").astype(str)
+    df["building_type"] = df["building_type"].fillna("unknown").astype(str)
+    df["action"] = df["action"].fillna("unknown").astype(str)
 
-    gdf = gdf.to_crs(metric_crs)
+    df["labor_hours"] = df["labor_hours"].astype(float)
+    df["concrete_m3"] = df["concrete_m3"].astype(float)
+    df["steel_tons"] = df["steel_tons"].astype(float)
+    df["equipment_hours"] = df["equipment_hours"].astype(float)
 
-    gdf["area_m2"] = gdf.geometry.area
-    gdf["perimeter_m"] = gdf.geometry.length
+    df["cost"] = df["cost"].astype(float)
+    df["duration_days"] = df["duration_days"].astype(float)
 
-    gdf["floors"] = gdf["floors"].fillna(1).astype(int)
-    gdf["damage_level"] = gdf["damage_level"].astype(float).clip(0, 1)
-
-    gdf["building_type"] = gdf["building_type"].fillna("unknown").astype(str)
-    gdf["zoning_category"] = gdf["zoning_category"].fillna("unknown").astype(str)
-
-    if "access_index" not in gdf.columns:
-        # Для training_projects.csv можно задать временно.
-        # Для buildings.geojson access_index считается через дороги.
-        gdf["access_index"] = 1.0
-
-    gdf["access_index"] = gdf["access_index"].astype(float).clip(0, 1)
-
-    return gdf
+    return df
 
 
 # 2. Подготовка GIS-признаков для buildings.geojson + roads.geojson
@@ -1290,6 +1282,208 @@ def load_models():
     return cost_model, time_model
 
 
+def save_dataframe_csv(
+    df: pd.DataFrame,
+    output_path: str,
+    drop_geometry: bool = True
+) -> None:
+    """
+    Безопасно сохраняет DataFrame/GeoDataFrame в CSV.
+
+    Если есть geometry, она либо удаляется, либо переводится в WKT.
+    """
+
+    out = df.copy()
+
+    if "geometry" in out.columns:
+        if drop_geometry:
+            out = out.drop(columns=["geometry"])
+        else:
+            out["geometry"] = out["geometry"].apply(
+                lambda geom: geom.wkt if geom is not None else None
+            )
+
+    out.to_csv(output_path, index=False)
+
+    print(f"Saved: {output_path}")
+    print(f"Rows: {len(out)}")
+
+
+def save_pipeline_outputs(
+    intermediate_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    opt_result: dict,
+    output_dir: str = "."
+) -> None:
+    """
+    Сохраняет промежуточные и итоговые таблицы pipeline.
+
+    Создаёт:
+    - intermediate_prediction_table.csv
+    - predictions_full_table.csv
+    - selected_budget_plan.csv
+    - selected_active_budget_plan.csv
+    - selected_deferred_plan.csv
+    - optimization_summary.csv
+    """
+
+    # --------------------------------------------------------
+    # 1. Промежуточная таблица до CatBoost
+    # --------------------------------------------------------
+
+    intermediate_columns = [
+        "building_id",
+        "area_m2",
+        "perimeter_m",
+        "floors",
+        "damage_level",
+        "access_index",
+        "zoning_category",
+        "building_type",
+        "action",
+        "q_ij",
+        "labor_hours",
+        "concrete_m3",
+        "steel_tons",
+        "equipment_hours",
+    ]
+
+    existing_intermediate_columns = [
+        col for col in intermediate_columns
+        if col in intermediate_df.columns
+    ]
+
+    save_dataframe_csv(
+        intermediate_df[existing_intermediate_columns],
+        f"{output_dir}/intermediate_prediction_table.csv"
+    )
+
+    # --------------------------------------------------------
+    # 2. Полная таблица прогнозов после CatBoost
+    # --------------------------------------------------------
+
+    prediction_columns = [
+        "building_id",
+        "area_m2",
+        "perimeter_m",
+        "floors",
+        "damage_level",
+        "access_index",
+        "zoning_category",
+        "building_type",
+        "action",
+        "q_ij",
+        "defer_priority",
+        "defer_penalty_i",
+        "labor_hours",
+        "concrete_m3",
+        "steel_tons",
+        "equipment_hours",
+        "C_hat_ij",
+        "T_hat_ij",
+    ]
+
+    existing_prediction_columns = [
+        col for col in prediction_columns
+        if col in pred_df.columns
+    ]
+
+    save_dataframe_csv(
+        pred_df[existing_prediction_columns],
+        f"{output_dir}/predictions_full_table.csv"
+    )
+
+    # --------------------------------------------------------
+    # 3. Итоговый выбранный план OR-Tools
+    # --------------------------------------------------------
+
+    selected = opt_result["selected"].copy()
+
+    selected_columns = [
+        "building_id",
+        "action",
+        "q_ij",
+        "area_m2",
+        "perimeter_m",
+        "floors",
+        "damage_level",
+        "access_index",
+        "zoning_category",
+        "building_type",
+        "defer_priority",
+        "defer_penalty_i",
+        "C_hat_ij",
+        "T_hat_ij",
+        "labor_hours",
+        "concrete_m3",
+        "steel_tons",
+        "equipment_hours",
+    ]
+
+    existing_selected_columns = [
+        col for col in selected_columns
+        if col in selected.columns
+    ]
+
+    selected = selected[existing_selected_columns].copy()
+
+    selected["is_deferred"] = selected["action"].eq("defer").astype(int)
+    selected["is_active"] = selected["action"].ne("defer").astype(int)
+
+    save_dataframe_csv(
+        selected,
+        f"{output_dir}/selected_budget_plan.csv"
+    )
+
+    # --------------------------------------------------------
+    # 4. Только активные здания, которые реально входят в бюджет работ
+    # --------------------------------------------------------
+
+    selected_active = selected[selected["action"] != "defer"].copy()
+
+    save_dataframe_csv(
+        selected_active,
+        f"{output_dir}/selected_active_budget_plan.csv"
+    )
+
+    # --------------------------------------------------------
+    # 5. Только отложенные здания
+    # --------------------------------------------------------
+
+    selected_deferred = selected[selected["action"] == "defer"].copy()
+
+    save_dataframe_csv(
+        selected_deferred,
+        f"{output_dir}/selected_deferred_plan.csv"
+    )
+
+    # --------------------------------------------------------
+    # 6. Краткая сводка оптимизации
+    # --------------------------------------------------------
+
+    summary = pd.DataFrame([{
+        "status": opt_result["status"],
+        "C_total": opt_result["C_total"],
+        "defer_penalty_total": opt_result["defer_penalty_total"],
+        "objective_value": opt_result["objective_value"],
+        "T_tech": opt_result["T_tech"],
+        "T_resource": opt_result["T_resource"],
+        "T_total": opt_result["T_total"],
+        "deferred_count": opt_result["deferred_count"],
+        "active_count": opt_result["active_count"],
+        "avg_defer_priority": opt_result["avg_defer_priority"],
+        "labor_hours": opt_result["resources"].get("labor_hours", 0),
+        "concrete_m3": opt_result["resources"].get("concrete_m3", 0),
+        "steel_tons": opt_result["resources"].get("steel_tons", 0),
+        "equipment_hours": opt_result["resources"].get("equipment_hours", 0),
+    }])
+
+    save_dataframe_csv(
+        summary,
+        f"{output_dir}/optimization_summary.csv"
+    )
+
+
 # 12. Полный пример запуска
 
 def run_full_pipeline():
@@ -1297,27 +1491,18 @@ def run_full_pipeline():
     Полный pipeline:
 
     1. Читает training_projects.csv
-    2. Готовит training_df
-    3. Обучает CatBoost
-    4. Читает buildings.geojson + roads.geojson
-    5. Создаёт пары building-action
-    6. Прогнозирует C_hat_ij и T_hat_ij
-    7. Оценивает сценарий
-    8. Оптимизирует план через OR-Tools
+    2. Обучает CatBoost
+    3. Читает buildings.geojson + roads.geojson
+    4. Создаёт пары building-action
+    5. Прогнозирует C_hat_ij и T_hat_ij
+    6. Оценивает сценарий
+    7. Оптимизирует план через OR-Tools
     """
 
     # 1. Training data
 
-    training_base = read_training_projects_csv(
-        csv_path="training_projects.csv",
-        source_crs="EPSG:4326",
-        metric_crs="EPSG:3857"
-    )
-
-    training_df = make_training_dataset(
-        base_buildings=training_base,
-        expand_all_actions=True,
-        random_seed=42
+    training_df = read_training_projects_table(
+        csv_path="training_projects.csv"
     )
 
     print("Training dataframe:")
@@ -1342,6 +1527,34 @@ def run_full_pipeline():
 
     building_action_df = build_building_action_table(buildings)
 
+    # --------------------------------------------------------
+    # Промежуточная таблица:
+    # GeoPandas + action + resources
+    # но ещё без C_hat_ij и T_hat_ij
+    # --------------------------------------------------------
+
+    intermediate_df = add_resource_needs(building_action_df)
+
+    save_dataframe_csv(
+        intermediate_df[[
+            "building_id",
+            "area_m2",
+            "perimeter_m",
+            "floors",
+            "damage_level",
+            "access_index",
+            "zoning_category",
+            "building_type",
+            "action",
+            "q_ij",
+            "labor_hours",
+            "concrete_m3",
+            "steel_tons",
+            "equipment_hours",
+        ]],
+        "intermediate_prediction_table.csv"
+    )
+
     # 4. Predict cost and time
 
     pred_df = predict_cost_time(
@@ -1349,10 +1562,35 @@ def run_full_pipeline():
         cost_model=cost_model,
         time_model=time_model
     )
-    
+
     pred_df = add_social_defer_penalty(
         pred_df,
         base_defer_penalty=200_000
+    )
+
+    # Сохраняем полную таблицу прогнозов
+    save_dataframe_csv(
+        pred_df[[
+            "building_id",
+            "area_m2",
+            "perimeter_m",
+            "floors",
+            "damage_level",
+            "access_index",
+            "zoning_category",
+            "building_type",
+            "action",
+            "q_ij",
+            "defer_priority",
+            "defer_penalty_i",
+            "labor_hours",
+            "concrete_m3",
+            "steel_tons",
+            "equipment_hours",
+            "C_hat_ij",
+            "T_hat_ij",
+        ]],
+        "predictions_full_table.csv"
     )
 
     print("\nPredictions:")
@@ -1409,16 +1647,21 @@ def run_full_pipeline():
         },
         alpha_cost=1.0,
         beta_time=1.0,
-
-        # Минимум одно здание должно быть реально обработано,
-        # остальные можно отложить, если бюджет мал.
         min_active_buildings=1,
-
-        # Например, не более 90% зданий можно отложить.
-        # Если хочешь разрешить откладывать сколько угодно, поставь None.
         max_deferred_ratio=0.90,
         defer_penalty=200_000,
         max_time_seconds=60
+    )
+
+    # --------------------------------------------------------
+    # Сохраняем итоговые таблицы оптимизации
+    # --------------------------------------------------------
+
+    save_pipeline_outputs(
+        intermediate_df=intermediate_df,
+        pred_df=pred_df,
+        opt_result=opt_result,
+        output_dir="."
     )
 
     print("\nOptimization result:")

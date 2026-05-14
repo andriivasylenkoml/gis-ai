@@ -1,0 +1,2 @@
+status,C_total,defer_penalty_total,objective_value,T_tech,T_resource,T_total,deferred_count,active_count,avg_defer_priority,labor_hours,concrete_m3,steel_tons,equipment_hours
+OPTIMAL,3989322.25,7965760.0,1195509745000.0,152.00325765688984,33.1391275,152.00325765688984,79,21,0.5041620253164557,26511.302000000003,56.668,3.779,796.002
